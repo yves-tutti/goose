@@ -7,12 +7,19 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
+	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
 )
+
+type goMigrationKey struct {
+	version  int64
+	filename string
+}
 
 var (
 	// ErrNoCurrentVersion when a current migration version is not found.
@@ -22,7 +29,7 @@ var (
 	// MaxVersion is the maximum allowed version.
 	MaxVersion int64 = math.MaxInt64
 
-	registeredGoMigrations = map[int64]*Migration{}
+	registeredGoMigrations = map[goMigrationKey]*Migration{}
 )
 
 // Migrations slice.
@@ -168,7 +175,21 @@ func register(
 		return fmt.Errorf("cannot mix tx and non-tx based go migrations functions")
 	}
 	v, _ := NumericComponent(filename)
-	if existing, ok := registeredGoMigrations[v]; ok {
+
+	// Get current working directory to resolve absolute filepath returned by runtime.Caller
+	// into a relative one like in collectMigrationsFS fs.Glob()
+	wd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to add migration %q: %w",
+			filename,
+			err)
+	}
+	relativeFilepath, _ := filepath.Rel(wd, filename)
+	key := goMigrationKey{
+		version:  v,
+		filename: relativeFilepath,
+	}
+	if existing, ok := registeredGoMigrations[key]; ok {
 		return fmt.Errorf("failed to add migration %q: version %d conflicts with %q",
 			filename,
 			v,
@@ -176,12 +197,12 @@ func register(
 		)
 	}
 	// Add to global as a registered migration.
-	registeredGoMigrations[v] = &Migration{
+	registeredGoMigrations[key] = &Migration{
 		Version:    v,
 		Next:       -1,
 		Previous:   -1,
 		Registered: true,
-		Source:     filename,
+		Source:     relativeFilepath,
 		UseTx:      useTx,
 		UpFn:       up,
 		DownFn:     down,
@@ -214,17 +235,6 @@ func collectMigrationsFS(fsys fs.FS, dirpath string, current, target int64) (Mig
 		}
 	}
 
-	// Go migrations registered via goose.AddMigration().
-	for _, migration := range registeredGoMigrations {
-		v, err := NumericComponent(migration.Source)
-		if err != nil {
-			return nil, fmt.Errorf("could not parse go migration file %q: %w", migration.Source, err)
-		}
-		if versionFilter(v, current, target) {
-			migrations = append(migrations, migration)
-		}
-	}
-
 	// Go migration files
 	goMigrationFiles, err := fs.Glob(fsys, path.Join(dirpath, "*.go"))
 	if err != nil {
@@ -240,11 +250,14 @@ func collectMigrationsFS(fsys fs.FS, dirpath string, current, target int64) (Mig
 			continue // Skip Go test files.
 		}
 
-		// Skip migrations already existing migrations registered via goose.AddMigration().
-		if _, ok := registeredGoMigrations[v]; ok {
+		// handle migrations registered via goose.AddMigration().
+		key := goMigrationKey{version: v, filename: file}
+		if migration, ok := registeredGoMigrations[key]; ok {
+			migrations = append(migrations, migration)
 			continue
 		}
 
+		// others, still handle them to show warning that they're not registered
 		if versionFilter(v, current, target) {
 			migration := &Migration{Version: v, Next: -1, Previous: -1, Source: file, Registered: false}
 			migrations = append(migrations, migration)
